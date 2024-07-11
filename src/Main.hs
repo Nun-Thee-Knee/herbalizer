@@ -54,6 +54,7 @@ container = do
 expression :: IParser Expression
 expression = (try escapeHtmlExpr <|> docType) <|> comment <|> hamlFilter <|> startPlainText <|> rubyBlock <|> rubyExp <|> tag <|> genericExpression
 
+rubyBlock :: IParser Expression
 rubyBlock = do
     char '-'
     spaces
@@ -61,16 +62,16 @@ rubyBlock = do
     rest <- manyTill anyChar newline <* spaces
     if (k `elem` midBlockKeywords)
     then return (RubyMidBlock $ k ++ rest)
-    -- TODO : we need to recognize Ruby expression expression included purely for a side effect,
-    -- e.g. "- localvar = Time.now"
     else return (RubyStartBlock (k ++ rest) False)
   where midBlockKeywords = ["else", "elsif", "rescue", "ensure", "when", "end"]
 
+escapeHtmlExpr :: IParser Expression
 escapeHtmlExpr = do
   char '!'
   line <- ((:) <$> char '=' >> spaces >> manyTill anyChar newline <* spaces)
   return $ RubyExp $ "raw(" ++ line ++ ")"
 
+rubyExp :: IParser Expression
 rubyExp = do
   line <- ((:) <$> char '=' >> spaces >> manyTill anyChar newline <* spaces)
   return (RubyExp line)
@@ -99,34 +100,42 @@ makeClassIdAttrs cs = classes : [("id", ids)]
     where classes = ("class", intercalate " " $ map tail $ filter ("." `isPrefixOf`) cs )
           ids = intercalate " " $ map tail $ filter (isPrefixOf "#") cs
 
+explicitTag :: IParser String
 explicitTag = do
   char '%'
   tag <- many alphaNum
   return tag
 
+dotClass :: IParser String
 dotClass = (:) <$> char '.' <*> cssClassOrId
+
+idHash :: IParser String
 idHash = (:) <$> char '#' <*> cssClassOrId
 
+hashAttrs :: IParser [(String, String)]
 hashAttrs = do
   char '{' 
   xs <- kvPair `sepBy` (spaces >> char ',' >> spaces)
   char '}'
   return xs
 
+cssClassOrId :: IParser String
 cssClassOrId = many (alphaNum <|> oneOf "-_")
-rubyIdentifier = many (alphaNum <|> char '_')
 
+rubyKeyword :: IParser String
 rubyKeyword = many alphaNum
 
+singleQuotedStr :: IParser String
 singleQuotedStr = do
     between (char '\'') (char '\'') (many stringChar)
   where stringChar = ('\'' <$ string "\\'") <|> (noneOf "'")
 
+doubleQuotedStr :: IParser String
 doubleQuotedStr = do
     between (char '"') (char '"') (many stringChar)
   where stringChar = ('"' <$ string "\\\"") <|> (noneOf "\"")
 
---- Ruby interpolation delimiters crudely replaced by ERB style
+rubyString :: IParser String
 rubyString = do
     between (char '"') (char '"') rString
   where 
@@ -134,6 +143,7 @@ rubyString = do
     stringChar = ('"' <$ string "\\\"") <|> (noneOf "\"") 
     replaceInterpolationDelim = (replace "#{" "<%= ") . (replace "}" " %>")
 
+rubySymbol :: IParser String
 rubySymbol =  do
       char ':' 
       xs <- (char '"' >> many stringChar2 <* char '"') <|> (char '\'' >> many stringChar1 <* char '\'') <|> rubyIdentifier 
@@ -141,9 +151,10 @@ rubySymbol =  do
   where stringChar1 = ('\'' <$ string "\\'") <|> (noneOf "'")
         stringChar2 = ('"' <$ string "\\\"") <|> (noneOf "\"")
 
+rubySymbolKey :: IParser String
 rubySymbolKey = rubyIdentifier <* char ':'
 
--- really, we need to parse full-blown Ruby expressions
+rubyValue :: IParser String
 rubyValue = do
     xs <- many (noneOf "},([ \t")  <* spaces
     rest <- ((lookAhead (oneOf ",}") >> return ""))
@@ -155,12 +166,16 @@ rubyValue = do
       xs' <- between (char x) (char y) (many $ noneOf [y])
       return $ [x] ++ xs' ++ [y]
 
+rocket :: IParser ()
 rocket = spaces >> string "=>" >> spaces 
+
+aKey :: IParser String
 aKey = (singleQuotedStr <* rocket)
   <|> (doubleQuotedStr <* rocket)
   <|> (rubySymbol <* rocket)
   <|> (rubySymbolKey <* spaces)
 
+aValue :: IParser String
 aValue = singleQuotedStr <|> rubyString <|> many1 digit <|> rubyValue
 
 kvPair :: IParser (String, String)
@@ -169,8 +184,6 @@ kvPair = do
   v <- spaces >> aValue <* (many $ oneOf " \t")
   return (k, v)
 
--- TODO HTML Comments are not rendered like HAML renders them
--- also HAML -# style comments could be rendered
 comment :: IParser Expression
 comment = do
   char '/' 
@@ -191,6 +204,7 @@ filterBlock p = withPos $ do
     r <- many (checkIndent >> p)
     return r
 
+hamlFilter :: IParser Expression
 hamlFilter = do
   withPos $ do
     char ':' 
@@ -202,6 +216,7 @@ hamlFilter = do
   where convertToTag "javascript" = "script"
         convertToTag s = s
 
+indentedOrBlank :: IParser [String]
 indentedOrBlank = many1 (try blankLine <|> try indentedLine)
 
 indentedLine :: IParser String
@@ -210,24 +225,21 @@ indentedLine = do
     s <- many (noneOf "\n")
     newline
     return $ case a of
-        () -> s  -- Return s directly if indented consumed nothing
-        _  -> ""  -- Handle the case where indented succeeds without consuming input
+        () -> s
+        _  -> ""
 
 blankLine :: IParser String
 blankLine = many (oneOf " \t") <* newline
 
--- Adjusting startPlainText to handle indented content
 startPlainText :: IParser Expression
 startPlainText = do
     t <- indentedLine
     return $ PlainText t
 
--- Adjusting genericExpression to handle indented content
 genericExpression :: IParser Expression
 genericExpression = do
     t <- indentedLine
     return $ GenericExpression t
-
 
 replace :: Eq a => [a] -> [a] -> [a] -> [a]
 replace from to xs = join' to . split' from $ xs
@@ -245,4 +257,24 @@ main = do
   file <- readFile $ head args
   case iParse container "" file of
     Left err -> print err
-    Right x -> print x
+    Right x -> putStrLn $ convertToERB x
+
+convertToERB :: Tree -> String
+convertToERB (Tree exp children) = case exp of
+    DocType s -> "<!DOCTYPE " ++ s ++ ">"
+    Comment s -> "<!-- " ++ s ++ " -->"
+    PlainText s -> s
+    RubyStartBlock s isFormTag -> "<% " ++ s ++ " %>"
+    RubyMidBlock s -> "<% " ++ s ++ " %>"
+    RubySideEffect s -> "<%= " ++ s ++ " %>"
+    RubyExp s -> "<%= " ++ s ++ " %>"
+    Tag tag attrs content ->
+        "<" ++ tag ++ " " ++ intercalate " " (map (\(k, v) -> k ++ "=\"" ++ v ++ "\"") attrs) ++
+        ">" ++ convertInlineContent content ++ "</" ++ tag ++ ">"
+    GenericExpression s -> s ++ "\n" ++ concatMap convertToERB children
+
+convertInlineContent :: InlineContent -> String
+convertInlineContent (RubyInlineContent s) = "<%= " ++ s ++ " %>"
+convertInlineContent (PlainInlineContent s) = s
+convertInlineContent NullInlineContent = ""
+convertInlineContent (HamlFilterContent s) = s
