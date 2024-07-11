@@ -1,21 +1,25 @@
 {-# LANGUAGE DoAndIfThenElse #-}
+{-# LANGUAGE FlexibleContexts #-}
+
 module Main where
-import Control.Applicative ((<$>), (<*>), (<*), (<$))
+
+import Control.Applicative ((<$>), (<*>), (<*), (<$>))
 import Control.Monad (liftM)
 import Control.Monad.State (State, runState)
 import Control.Applicative ((<*))
 import Text.Parsec hiding (State)
 import Text.Parsec.Indent
 import Text.Parsec.Pos
-import Data.List (isPrefixOf, isInfixOf, intercalate, intersperse)
+import Data.List (isPrefixOf, isInfixOf, intercalate, intersperse, tails)
 import qualified Data.Map as M
 import Text.Regex.Posix
 import System.Environment
+import Control.Monad.Identity (Identity)
 
-type IParser a = ParsecT String () (State SourcePos) a
+type IParser a = ParsecT String () (IndentT Identity) a
 
 iParse :: IParser a -> SourceName -> String -> Either ParseError a
-iParse p s inp = runIndent s $ runParserT p () s inp
+iParse p s inp = runIndent $ runParserT p () s inp
 
 data Tree = Tree Expression [Tree]
     deriving (Show)
@@ -26,7 +30,6 @@ data InlineContent = RubyInlineContent String
     | NullInlineContent
     | HamlFilterContent String
     deriving (Show, Eq)
-
 
 type IsFormTag = Bool
 
@@ -49,8 +52,8 @@ container = do
   return b
 
 expression :: IParser Expression
-expression = (try escapeHtmlExpr <|> docType) <|> comment <|> hamlFilter <|> startPlainText <|> rubyBlock <|> rubyExp <|> tag <|>  genericExpression
-  
+expression = (try escapeHtmlExpr <|> docType) <|> comment <|> hamlFilter <|> startPlainText <|> rubyBlock <|> rubyExp <|> tag <|> genericExpression
+
 rubyBlock = do
     char '-'
     spaces
@@ -96,7 +99,6 @@ makeClassIdAttrs cs = classes : [("id", ids)]
     where classes = ("class", intercalate " " $ map tail $ filter ("." `isPrefixOf`) cs )
           ids = intercalate " " $ map tail $ filter (isPrefixOf "#") cs
 
-
 explicitTag = do
   char '%'
   tag <- many alphaNum
@@ -124,7 +126,7 @@ doubleQuotedStr = do
     between (char '"') (char '"') (many stringChar)
   where stringChar = ('"' <$ string "\\\"") <|> (noneOf "\"")
 
---- Ruby interpolation delimiters crudley replaced by ERB style
+--- Ruby interpolation delimiters crudely replaced by ERB style
 rubyString = do
     between (char '"') (char '"') rString
   where 
@@ -184,6 +186,7 @@ docType = do
     newline
     return $ DocType s
 
+filterBlock :: (Stream s (IndentT m) z, Monad m) => ParsecT s u (IndentT m) a -> IndentParserT s u m [a]
 filterBlock p = withPos $ do
     r <- many (checkIndent >> p)
     return r
@@ -203,230 +206,43 @@ indentedOrBlank = many1 (try blankLine <|> try indentedLine)
 
 indentedLine :: IParser String
 indentedLine = do
-    a <- many $ oneOf " \t"
-    indented
-    xs <- manyTill anyChar newline 
-    return $ a ++ xs ++ "\n"
+    a <- indented
+    s <- many (noneOf "\n")
+    newline
+    return $ case a of
+        () -> s  -- Return s directly if indented consumed nothing
+        _  -> ""  -- Handle the case where indented succeeds without consuming input
 
-blankLine = do
-    a <- many $ oneOf " \t"
-    newline 
-    return $ a ++ "\n"
+blankLine :: IParser String
+blankLine = many (oneOf " \t") <* newline
 
--- TODO; check how this deals with plain text that actually starts with these characters
--- Not sure what HAML's escaping rules are here; again HAML makes things unclear & make you
--- to look at docs
+-- Adjusting startPlainText to handle indented content
+startPlainText :: IParser Expression
+startPlainText = do
+    t <- indentedLine
+    return $ PlainText t
 
-startPlainText = do 
-  spaces
-  a <- noneOf "-=.#%" 
-  b <- manyTill anyChar newline
-  spaces
-  return $ PlainText (a:b)
-
+-- Adjusting genericExpression to handle indented content
 genericExpression :: IParser Expression
 genericExpression = do
-  spaces
-  s <- manyTill anyChar newline
-  spaces
-  return $ GenericExpression s
+    t <- indentedLine
+    return $ GenericExpression t
 
-
-------------------------------------------------------------------------
--- output ERB
--- turn tree structure into an array of lines, including closing tags and indentation level
-
-
-type Nesting = Int
-
--- This is the main processing entrypoint
-processChildren :: Nesting -> [Tree] -> [String]
-processChildren n xs = concat $ map (erb n) $ (rubyEnd xs)
-
-erb ::  Nesting -> Tree -> [String]
-
-erb n tree@(Tree (Tag t a i) []) 
-    | t `elem` selfClosingTags = [pad n ++ selfClosingTag tree]
-    -- basically ignores inline content
-  where selfClosingTags = ["br", "img", "hr", "meta"]
-
--- no children; no padding, just tack closing tag on end
-erb n tree@(Tree (Tag t a i) []) = [pad n ++ startTag tree ++ endTag 0 tree] 
-
-erb n tree@(Tree (Tag t a i) xs) = (pad n ++ startTag tree) : ((processChildren (n + 1) xs) ++ [endTag n tree])
-
-erb n tree@(Tree (RubyStartBlock s isform) xs) = 
-    (pad n ++ (starttag isform) ++ s ++ " %>") : (processChildren (n + 1) xs)
-  where 
-    starttag True = "<%= "
-    starttag False = "<% "
-
-
-erb n tree@(Tree (RubyMidBlock s) xs) = 
-    (pad n ++ "<% " ++ s ++ " %>") : (processChildren (n + 1) xs)
-
-erb n tree@(Tree (RubyExp s) _) = [pad n ++ "<%= " ++ s ++ " %>"] 
-
-erb n tree@(Tree (RubySideEffect s) []) = [pad n ++ "<% " ++ s ++ " %>"] 
-
-erb n tree@(Tree (PlainText s) _) = [pad n ++ s] 
-erb n tree@(Tree (Comment s) xs) = (pad n ++ "<!--" ++ s) : ((processChildren (n + 1) xs) ++ [pad n  ++ "-->"])
-
--- DocTypes
-erb n tree@(Tree (DocType s) _) = [d s]
-  where
-    d "" = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">"
-    d "Strict" = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">"
-    d "Frameset" = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Frameset//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd\">"
-    d "1.1" = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.1//EN\" \"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd\">"
-    d "Basic" = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML Basic 1.1//EN\" \"http://www.w3.org/TR/xhtml-basic/xhtml-basic11.dtd\">"
-    d "Mobile" = "<!DOCTYPE html PUBLIC \"-//WAPFORUM//DTD XHTML Mobile 1.2//EN\" \"http://www.openmobilealliance.org/tech/DTD/xhtml-mobile12.dtd\">"
-    d "RDFa" = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML+RDFa 1.0//EN\" \"http://www.w3.org/MarkUp/DTD/xhtml-rdfa-1.dtd\">"
-    d "5" = "<!DOCTYPE html>"
-
-
-    d _ = "TEST"
-
-erb n x@_ = [pad n ++ show x]
-
-
--- Ruby expressions with no output and no children; convert to RubySideEffect type
-rubyEnd ((Tree (RubyStartBlock s False) []):xs) = rubyEnd $ (Tree (RubySideEffect s) []):xs 
-
--- Try to insert "<% end %>" tags correctly
-rubyEnd (x@(Tree (RubyStartBlock _ _) _):y@(Tree (RubyMidBlock _) _):xs) = 
-    x:(rubyEnd (y:xs))  -- just shift the cursor to the right
-rubyEnd (x@(Tree (RubyMidBlock _) _):y@(Tree (RubyMidBlock _) _):xs) = 
-    x:(rubyEnd (y:xs))
-rubyEnd (x@(Tree (RubyStartBlock _ _) _):xs) = x:endTagTree:(rubyEnd xs)
-rubyEnd (x@(Tree (RubyMidBlock _) _):xs) = x:endTagTree:(rubyEnd xs)
-
--- RubyExp with children is probably a form_for or the like; convert to a RubyStartBlock
-rubyEnd (x@(Tree (RubyExp s) children@(c:cs)):xs) = rubyEnd $ (Tree (RubyStartBlock s True) children):xs
-
--- Move inline Ruby expressions to child tree
-rubyEnd (x@(Tree (Tag t a (RubyInlineContent s)) ts):xs) = 
-  (Tree (Tag t a NullInlineContent) ((Tree (RubyExp s) []):ts)):(rubyEnd xs)
-
--- erb content should pass through
-rubyEnd (x@(Tree (Tag "erb" a (HamlFilterContent s)) ts):xs) = (Tree (PlainText s) []):(rubyEnd xs)
-
--- Move HamlFilterContent to child tree
-rubyEnd (x@(Tree (Tag t a (HamlFilterContent s)) ts):xs) = (Tree (Tag t a NullInlineContent) ((Tree (PlainText ('\n':s)) []):ts)):(rubyEnd xs)
-
-rubyEnd (x:xs) = x : (rubyEnd xs)
-rubyEnd [] = []
-
-
-endTagTree = Tree (PlainText "<% end %>") []
-
-
-startTag :: Tree -> String
-startTag (Tree (Tag t a i) _) = "<" ++ t ++ showAttrs a ++ ">" ++ showInlineContent i
-
-endTag :: Int -> Tree -> String
-endTag n (Tree (Tag t _ _) _) = pad n ++ "</" ++ t ++ ">"
-
-selfClosingTag :: Tree -> String
-selfClosingTag (Tree (Tag t a _) _) = "<" ++ t ++ showAttrs a ++ "/>"
-
-showAttrs xs = case map makeAttr xs of 
-      [] -> ""
-      xs' -> " " ++ intercalate " " xs'
-    where makeAttr (k,v) =  intercalate "=" [k, "\"" ++ v ++ "\"" ]
-
-showInlineContent (PlainInlineContent s) = s
-showInlineContent (NullInlineContent) = ""
--- should not be reached:
-showInlineContent (RubyInlineContent s) = "RUBY: " ++ s 
-
-showInlineContent s = "\nERROR: No showInlineContent for " ++ (show s) ++ "\n"
-
-    
-pad :: Int -> String
-pad n = take (n * 2) $ repeat ' ' 
-
-------------------------------------------------------------------------
-
-mapEithers :: (a -> Either b c) -> [a] -> Either b [c]
-mapEithers f (x:xs) = case mapEithers f xs of
-    Left err -> Left err
-    Right ys -> case f x of 
-                  Left err -> Left err
-                  Right y -> Right (y:ys)
-mapEithers _ _ = Right []
-
-
--- the following functions are extracted from MissingH Data.List.Utils 
--- by John Goerzen <jgoerzen@complete.org>
 
 replace :: Eq a => [a] -> [a] -> [a] -> [a]
-replace old new l = join new . split old $ l
+replace from to xs = join' to . split' from $ xs
+    where join' j = foldr1 (\a b -> a ++ j ++ b)
+          split' [] _ = error "empty"
+          split' delim' str = split'' str
+              where split'' [] = [[]]
+                    split'' l@(x:xs)
+                        | delim' `isPrefixOf` l = [] : split'' (drop (length delim') l)
+                        | otherwise = let (y:ys) = split'' xs in (x : y) : ys
 
-join :: [a] -> [[a]] -> [a]
-join delim l = concat (intersperse delim l)
-
-breakList :: ([a] -> Bool) -> [a] -> ([a], [a])
-breakList func = spanList (not . func)
-
-spanList :: ([a] -> Bool) -> [a] -> ([a], [a])
-
-spanList _ [] = ([],[])
-spanList func list@(x:xs) =
-    if func list
-       then (x:ys,zs)
-       else ([],list)
-    where (ys,zs) = spanList func xs
-
-split :: Eq a => [a] -> [a] -> [[a]]
-split _ [] = []
-split delim str =
-    let (firstline, remainder) = breakList (startswith delim) str
-        in
-        firstline : case remainder of
-                                   [] -> []
-                                   x -> if x == delim
-                                        then [] : []
-                                        else split delim
-                                                 (drop (length delim) x)
-
-
-startswith :: Eq a => [a] -> [a] -> Bool
-startswith = isPrefixOf
-
-
-------------------------------------------------------------------------
-
-parse1 s = iParse container "" s 
-
--- http://stackoverflow.com/questions/15549050/haskell-parsec-how-do-you-use-the-functions-in-text-parsec-indent
-runIndentParser :: (SourcePos -> SourcePos) 
-          -> IndentParser String () a 
-          -> String -> Either ParseError a
-runIndentParser f p src = fst $ flip runState (f $ initialPos "") $ runParserT p () "" src
-
-topLevelsParser1 = many1 (topLevelItem)
-
-topLevelItem = do
-  withPos $ do
-    as <- manyTill anyChar newline
-    xs <- option [] (try indentedOrBlank)
-    return $ as ++ "\n" ++ concat xs
-
-parseTopLevels s =
-    case (runIndentParser id topLevelsParser1 s) of
-      Left err -> putStrLn (show err)
-      Right chunks -> do
-        case (mapEithers parse1 chunks) of
-          Left err -> putStrLn . show $ err
-          Right trees -> do
-            mapM_ putStrLn $ processChildren 0 trees
-
+main :: IO ()
 main = do
-    args <- getArgs
-    if (null args)
-    then
-      getContents >>= parseTopLevels 
-    else
-      mapM_ (\f -> readFile f >>= parseTopLevels) args
-      
+  args <- getArgs
+  file <- readFile $ head args
+  case iParse container "" file of
+    Left err -> print err
+    Right x -> print x
