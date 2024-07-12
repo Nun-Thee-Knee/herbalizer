@@ -114,4 +114,8 @@ patch.
 * [Why I don't like HAML](http://blog.getify.com/why-i-dont-like-haml/)
 * [My thoughts on Haml and ERB](https://speakerdeck.com/klaustopher/erb)
 
-
+# RUNNING THE CODE ON LOCAL ENVIRONMENT
+Type the following command:-
+ghc --make -package mtl -package parsec -package indents src/Main.hs
+Then use the following command:-
+./src/Main your_file.haml > output.erb
